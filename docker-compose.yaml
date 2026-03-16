@@ -1,0 +1,238 @@
+networks:
+  flux-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+
+volumes:
+  etcd-data:
+  rabbitmq-data:
+  kv-server-1-data:
+  kv-server-2-data:
+  kv-server-3-data:
+  cdc-logs:
+  prometheus-targets:
+
+services:
+  # ===== 基础设施层 =====
+
+  etcd:
+    image: public.ecr.aws/bitnami/etcd:3.5
+    container_name: flux-etcd
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/bitnami/etcd
+    networks:
+      - flux-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: flux-rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - flux-net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.53
+    container_name: flux-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "16686:16686" # Jaeger UI
+    networks:
+      - flux-net
+    restart: unless-stopped
+
+  # ===== 存储层 =====
+
+  kv-server-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: flux-kv-server-1
+    hostname: kv-server-1
+    environment:
+      - FLUX_ETCD_ENDPOINTS=etcd:2379
+      - FLUX_RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      - FLUX_JAEGER_ENDPOINT=jaeger:4317
+      - FLUX_AOF_FILENAME=/app/data/kv-server-1.aof
+      - FLUX_PPROF_ENABLED=true
+      - FLUX_POD_IP=kv-server-1
+    ports:
+      - "50052:50052"
+      - "9091:9090"
+    volumes:
+      - kv-server-1-data:/app/data
+    networks:
+      - flux-net
+    depends_on:
+      etcd:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  kv-server-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: flux-kv-server-2
+    hostname: kv-server-2
+    environment:
+      - FLUX_ETCD_ENDPOINTS=etcd:2379
+      - FLUX_RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      - FLUX_JAEGER_ENDPOINT=jaeger:4317
+      - FLUX_AOF_FILENAME=/app/data/kv-server-2.aof
+      - FLUX_PPROF_ENABLED=true
+      - FLUX_POD_IP=kv-server-2
+    ports:
+      - "50053:50052"
+      - "9092:9090"
+    volumes:
+      - kv-server-2-data:/app/data
+    networks:
+      - flux-net
+    depends_on:
+      etcd:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  kv-server-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: flux-kv-server-3
+    hostname: kv-server-3
+    environment:
+      - FLUX_ETCD_ENDPOINTS=etcd:2379
+      - FLUX_RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      - FLUX_JAEGER_ENDPOINT=jaeger:4317
+      - FLUX_AOF_FILENAME=/app/data/kv-server-3.aof
+      - FLUX_PPROF_ENABLED=true
+      - FLUX_POD_IP=kv-server-3
+    ports:
+      - "50054:50052"
+      - "9093:9090"
+    volumes:
+      - kv-server-3-data:/app/data
+    networks:
+      - flux-net
+    depends_on:
+      etcd:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  # ===== 网关层 =====
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: flux-gateway
+    environment:
+      - FLUX_ETCD_ENDPOINTS=etcd:2379
+      - FLUX_JAEGER_ENDPOINT=jaeger:4317
+      - FLUX_GATEWAY_PORT=8080
+      - FLUX_PPROF_ENABLED=false
+      - FLUX_PPROF_PORT=6060
+    ports:
+      - "8080:8080"
+      - "6060:6060"
+    networks:
+      - flux-net
+    depends_on:
+      etcd:
+        condition: service_healthy
+      kv-server-1:
+        condition: service_started
+    restart: unless-stopped
+
+  # ===== 数据流层 =====
+
+  cdc-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: flux-cdc-consumer
+    environment:
+      - FLUX_RABBITMQ_URL=amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672/
+      - FLUX_CDC_EXCHANGE=flux_kv_events
+      - FLUX_CDC_QUEUE=flux_cdc_file_logger
+      - FLUX_CDC_LOG_PATH=/app/logs/flux_cdc.log
+    volumes:
+      - cdc-logs:/app/logs
+    networks:
+      - flux-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===== 监控服务 =====
+
+  prometheus-sd:
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus-sd
+    container_name: flux-prometheus-sd
+    environment:
+      - FLUX_ETCD_ENDPOINTS=etcd:2379
+    ports:
+      - "8081:8080"
+    volumes:
+      - prometheus-targets:/etc/prometheus/targets
+    networks:
+      - flux-net
+    depends_on:
+      etcd:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: flux-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yaml:/etc/prometheus/prometheus.yml
+      - prometheus-targets:/etc/prometheus/targets
+    networks:
+      - flux-net
+    depends_on:
+      - prometheus-sd
+    restart: unless-stopped

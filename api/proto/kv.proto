@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+// 这里的 "Flux-KV" 对应你 go.mod 里的 module 名
+// ";service" 告诉工具，生成出来的 Go 代码，包名(package)叫 service
+option go_package = "Flux-KV/api/proto;service";
+
+package service;
+
+// 定义服务：就像定义 Go 的 interface
+service KVService {
+  // 格式：rpc 方法名 (请求参数) returns (返回参数);
+  rpc Set (SetRequest) returns (SetResponse);
+  rpc Get (GetRequest) returns (GetResponse);
+  rpc Del (DelRequest) returns (DelResponse);
+}
+
+// --- 下面是具体的“包裹”定义 ---
+
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message SetResponse {
+  bool success = 1;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  string value = 1;
+  bool found = 2; // 用这个标记来区分 "空字符串" 和 "没找到"
+}
+
+message DelRequest {
+  string key = 1;
+}
+
+message DelResponse {
+  bool success = 1;
+}

@@ -1,0 +1,30 @@
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+RUN go build -ldflags="-w -s" -o /app/flux-consumer cmd/cdc_consumer/main.go
+
+FROM alpine:latest
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=builder /app/flux-consumer .
+COPY configs /app/configs
+
+RUN addgroup -g 1000 flux && \
+    adduser -D -u 1000 -G flux flux && \
+    mkdir -p /app/logs && \
+    chown -R flux:flux /app
+
+USER flux
+
+VOLUME /app/logs
+
+ENTRYPOINT ["/app/flux-consumer"]

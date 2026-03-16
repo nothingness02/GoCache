@@ -1,0 +1,23 @@
+# 构建产物
+bin/
+*.log
+*.aof
+
+# 版本控制
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# 测试和脚本
+scripts/
+tools/stress_test/
+
+# 文档
+*.md
+!README.md
+
+# 敏感信息
+.env

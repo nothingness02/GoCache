@@ -1,0 +1,12 @@
+global:
+    scrape_interval: 15s
+scrape_configs:
+    - job_name: 'kv-server'
+      file_sd_configs:
+            - files:
+                - '/etc/prometheus/targets/kv-server.json'
+              refresh_interval: 15s  # 每 15 秒检查一次文件变化
+
+    - job_name: 'gateway'
+      static_configs:
+        - targets: ['gateway:8080']    
