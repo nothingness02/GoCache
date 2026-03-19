@@ -12,17 +12,17 @@ import (
 
 // 定义分片数量，在大并发下足够减少锁冲突
 const ShardCount = 256
-
+const DefaultSharedSize = 10 * 1024 * 1024 // 每个分片默认64MB
 // Item 封装了值和过期时间
 type Item struct {
-	Val      any
+	Val      []byte
 	ExpireAt int64
 }
 
 // 定义分片结构
 type shard struct {
 	mu   sync.RWMutex
-	data map[string]*Item
+	data *ZeroGCShard
 }
 
 // MemDB 内存数据库核心结构
@@ -63,7 +63,7 @@ func NewMemDB(cfg *config.Config) (*MemDB, error) {
 	// 初始化所有分片
 	for i := 0; i < ShardCount; i++ {
 		db.shards[i] = &shard{
-			data: make(map[string]*Item),
+			data: NewZeroGCShard(DefaultSharedSize),
 		}
 	}
 
@@ -117,12 +117,9 @@ func (db *MemDB) loadFromAof() error {
 		s.mu.Lock()
 		switch cmd.Type {
 		case "set":
-			s.data[cmd.Key] = &Item{
-				Val:      cmd.Value,
-				ExpireAt: 0,
-			}
+			s.data.Set(cmd.Key, []byte(cmd.Value), 0) // 恢复时不设置过期时间，等同于永久存储
 		case "del":
-			delete(s.data, cmd.Key)
+			s.data.Delete(cmd.Key)
 		}
 		s.mu.Unlock()
 	}
@@ -135,14 +132,9 @@ func (db *MemDB) Set(key string, val any, ttl time.Duration) {
 	// 1. 定位分片
 	s := db.getShard(key)
 
-	var expireAt int64 = 0
-	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixNano()
-	}
-
 	// 2. 分片加锁（细粒度）
 	s.mu.Lock()
-	s.data[key] = &Item{val, expireAt}
+	s.data.Set(key, val.([]byte), ttl)
 	s.mu.Unlock()
 
 	// 3. 写 AOF
@@ -150,7 +142,7 @@ func (db *MemDB) Set(key string, val any, ttl time.Duration) {
 		cmd := aof.Cmd{
 			Type:  "set",
 			Key:   key,
-			Value: val,
+			Value: val.(string), // 这里假设 val 是 string 类型，实际使用中可能需要更灵活的序列化
 		}
 		if err := db.aofHandler.AsyncWrite(cmd); err != nil {
 			log.Printf("❌ AOF Write Error: %v", err)
@@ -173,37 +165,13 @@ func (db *MemDB) Get(key string) (any, bool) {
 
 	// 1. 分片读锁
 	s.mu.RLock()
-	item, ok := s.data[key]
+	item, err := s.data.Get(key)
 	s.mu.RUnlock()
 
-	if !ok {
+	if err != nil {
 		return nil, false
 	}
-
-	// 2. 惰性删除判断
-	if item.ExpireAt > 0 && time.Now().UnixNano() > item.ExpireAt {
-		// 发现过期，惰性删除
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		// Double Check双重检查，防止加锁间隙被其他协程处理
-		newItem, exists := s.data[key]
-		if !exists {
-			// 已经被别人删了
-			return nil, false
-		}
-
-		// 依然存在，且依然是过期状态，真删
-		if newItem.ExpireAt > 0 && time.Now().UnixNano() > newItem.ExpireAt {
-			delete(s.data, key)
-			return nil, false
-		}
-
-		// 第一次看过期，第二次看续命
-		return newItem.Val, true
-	}
-
-	return item.Val, true
+	return item, true
 }
 
 // Del 手动删除数据
@@ -212,7 +180,7 @@ func (db *MemDB) Del(key string) {
 
 	s.mu.Lock()
 	// 删内存
-	delete(s.data, key)
+	s.data.Delete(key)
 	s.mu.Unlock()
 
 	// 写 AOF
@@ -257,47 +225,4 @@ func (db *MemDB) Close() error {
 		return fmt.Errorf("close errors: %v", errs)
 	}
 	return nil
-}
-
-// StartGC 启动定期清理（Garbage Collection）
-// interval: 清理间隔，例如1秒
-func (db *MemDB) StartGC(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		for range ticker.C {
-			db.activeCleanup()
-		}
-	}()
-}
-
-// activeCleanup 遍历 map 清理过期数据
-func (db *MemDB) activeCleanup() {
-	now := time.Now().UnixNano()
-
-	// 遍历每一个分片
-	for _, s := range db.shards {
-		// 1. 快速读锁检查
-		s.mu.RLock()
-		var expireKeys []string
-		for key, item := range s.data {
-			if item.ExpireAt > 0 && now > item.ExpireAt {
-				expireKeys = append(expireKeys, key)
-			}
-		}
-		s.mu.RUnlock()
-
-		// 2. 如果有需要删除的 Key，再加写锁
-		if len(expireKeys) > 0 {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-
-			for _, key := range expireKeys {
-				// Double Check
-				item, exists := s.data[key]
-				if exists && item.ExpireAt > 0 && time.Now().UnixNano() > item.ExpireAt {
-					delete(s.data, key)
-				}
-			}
-		}
-	}
 }
