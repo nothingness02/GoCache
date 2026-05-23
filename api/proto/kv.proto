@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+option go_package = "Flux-KV/api/proto;service";
+
+package service;
+
+service KVService {
+  rpc Set (SetRequest) returns (SetResponse);
+  rpc Get (GetRequest) returns (GetResponse);
+  rpc Del (DelRequest) returns (DelResponse);
+  rpc InternalSet (InternalSetRequest) returns (InternalSetResponse);
+  rpc Status (StatusRequest) returns (StatusResponse);
+  rpc RaftInfo (RaftInfoRequest) returns (RaftInfoResponse);
+}
+
+message SetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message SetResponse {
+  bool success = 1;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  string value = 1;
+  bool found = 2;
+}
+
+message DelRequest {
+  string key = 1;
+}
+
+message DelResponse {
+  bool success = 1;
+}
+
+// InternalSet 节点间数据迁移专用写入（绕过 Raft，直接写入 engine）
+message InternalSetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message InternalSetResponse {
+  bool success = 1;
+}
+
+// Status 查询节点状态
+message StatusRequest {}
+
+message StatusResponse {
+  string node_id = 1;
+  string mode = 2;       // "cp" | "ap"
+  string engine_type = 3;
+  EngineStatsMsg stats = 4;
+  bool healthy = 5;
+}
+
+message EngineStatsMsg {
+  string engine_type = 1;
+  int64 entry_count = 2;
+  int64 memory_bytes = 3;
+}
+
+// RaftInfo 查询 Raft 状态（仅 CP 模式有效）
+message RaftInfoRequest {}
+
+message RaftInfoResponse {
+  string role = 1;
+  uint64 term = 2;
+  uint64 commit_index = 3;
+  uint64 last_applied = 4;
+  int32 healthy_nodes = 5;
+  repeated string peers = 6;
+}
