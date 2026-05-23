@@ -101,8 +101,6 @@ curl "http://localhost:8080/api/v1/kv?key=config&mode=cp"
 }
 ```
 
-- `shared`: 表示是否命中 SingleFlight 合并请求（防缓存击穿）
-
 **Error Response:**
 - `400 Bad Request`: 缺少 key 参数
 - `404 Not Found`: Key 不存在或查询失败
@@ -165,8 +163,8 @@ curl http://localhost:8080/admin/nodes
         "group_id": "cp-group-1",
         "mode": "cp",
         "is_leader": true,
-        "engine_type": "memdb",
-        "raft_addr": ":12001"
+        "engine_type": "zerogc-sharded",
+        "raft_addr": "cp-node-1:50052"
     },
     {
         "key": "/services/kv-service/ap-node-1:50052",
@@ -175,7 +173,7 @@ curl http://localhost:8080/admin/nodes
         "group_id": "ap-group-1",
         "mode": "ap",
         "is_leader": false,
-        "engine_type": "simplemap",
+        "engine_type": "map-sharded",
         "raft_addr": ""
     }
 ]
@@ -206,9 +204,9 @@ curl "http://localhost:8080/admin/nodes/ap-node-1:50052/status"
 {
     "node_id": "cp-1",
     "mode": "cp",
-    "engine_type": "memdb",
+    "engine_type": "zerogc-sharded",
     "stats": {
-        "engine_type": "memdb",
+        "engine_type": "zerogc-sharded",
         "entry_count": 150,
         "memory_bytes": 24576
     },
@@ -229,9 +227,9 @@ curl "http://localhost:8080/admin/nodes/ap-node-1:50052/status"
 {
     "node_id": "",
     "mode": "ap",
-    "engine_type": "simplemap",
+    "engine_type": "map-sharded",
     "stats": {
-        "engine_type": "simplemap",
+        "engine_type": "map-sharded",
         "entry_count": 3200,
         "memory_bytes": 524288
     },
@@ -269,60 +267,7 @@ curl http://localhost:8080/admin/stats
 
 ---
 
-## System Check
-
-### Health Probe
-
-用于 K8s 或 Docker Compose 的健康检查探针。
-
-- **URL**: `/health`
-- **Method**: `GET`
-
-**Response:**
-```json
-{
-    "status": "ok",
-    "time": "2026-02-12T10:00:00Z"
-}
-```
-
----
-
-## gRPC Service Methods
-
-除 HTTP 网关外，KV Server 直接暴露以下 gRPC 方法（定义于 `api/proto/kv.proto`）：
-
-### KVService
-
-| Method | Request | Response | Description |
-|--------|---------|----------|-------------|
-| `Set` | `SetRequest` {key, value} | `SetResponse` | 写入键值 |
-| `Get` | `GetRequest` {key} | `GetResponse` {value} | 读取键值 |
-| `Del` | `DelRequest` {key} | `DelResponse` | 删除键值 |
-| `Status` | `StatusRequest` | `StatusResponse` | 节点状态（引擎统计、健康状态） |
-| `RaftInfo` | `RaftInfoRequest` | `RaftInfoResponse` | Raft 状态（角色、任期、提交索引） |
-
-> `Status` 和 `RaftInfo` 主要用于管理接口和监控采集。AP 节点调用 `RaftInfo` 会返回错误。
-
----
-
-## Error Codes
-
-| HTTP Status | gRPC Code | 说明 |
-|-------------|-----------|------|
-| 400 | `INVALID_ARGUMENT` | 参数错误 |
-| 404 | `NOT_FOUND` | Key 不存在 |
-| 429 | `RESOURCE_EXHAUSTED` | 触发限流 |
-| 500 | `INTERNAL` | 内部错误（存储失败、Raft 无 Leader 等） |
-| 503 | `UNAVAILABLE` | 服务不可用（熔断触发） |
-
----
-
-**最后更新**: 2026-05-20
-
----
-
-## Admin Endpoints
+## System & Admin Endpoints
 
 ### 1. Health Check (存活探测)
 
@@ -380,3 +325,37 @@ GET /metrics
 - `flux_kv_grpc_request_duration_seconds` — 请求延迟分布
 - `flux_kv_aof_commands_total` — AOF 写入命令数
 - `flux_raft_role` — Raft 节点角色（0=Follower, 1=Candidate, 2=Leader）
+
+---
+
+## gRPC Service Methods
+
+除 HTTP 网关外，KV Server 直接暴露以下 gRPC 方法（定义于 `api/proto/kv.proto`）：
+
+### KVService
+
+| Method | Request | Response | Description |
+|--------|---------|----------|-------------|
+| `Set` | `SetRequest` {key, value} | `SetResponse` | 写入键值 |
+| `Get` | `GetRequest` {key} | `GetResponse` {value} | 读取键值 |
+| `Del` | `DelRequest` {key} | `DelResponse` | 删除键值 |
+| `Status` | `StatusRequest` | `StatusResponse` | 节点状态（引擎统计、健康状态） |
+| `RaftInfo` | `RaftInfoRequest` | `RaftInfoResponse` | Raft 状态（角色、任期、提交索引） |
+
+> `Status` 和 `RaftInfo` 主要用于管理接口和监控采集。AP 节点调用 `RaftInfo` 会返回错误。
+
+---
+
+## Error Codes
+
+| HTTP Status | gRPC Code | 说明 |
+|-------------|-----------|------|
+| 400 | `INVALID_ARGUMENT` | 参数错误 |
+| 404 | `NOT_FOUND` | Key 不存在 |
+| 429 | `RESOURCE_EXHAUSTED` | 触发限流 |
+| 500 | `INTERNAL` | 内部错误（存储失败、Raft 无 Leader 等） |
+| 503 | `UNAVAILABLE` | 服务不可用（熔断触发） |
+
+---
+
+**最后更新**: 2026-05-23

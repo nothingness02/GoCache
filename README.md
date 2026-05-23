@@ -82,7 +82,7 @@ graph TD
 
     subgraph AP Layer [AP Storage Layer — 高可用]
         APNodes[AP Node Group]
-        APNodes -->|Direct Write| APShards[Sharded MemDB / SimpleMap]
+        APNodes -->|Direct Write| APShards[ShardedEngine: Locker + Shard]
     end
 
     ClientSide -->|CP Route| CPNodes
@@ -151,16 +151,18 @@ sequenceDiagram
 
 ### 服务端工业标准特性
 
-- **统一 Server 包装** (`internal/server/server.go`):
-  - 封装 gRPC Server、Metrics HTTP Server、Health Check、Etcd Registry、Storage Engine
-  - `Start()` 顺序启动所有组件
-  - `Stop(timeout)` 分阶段优雅关闭：NOT_SERVING → 撤销 Etcd → GracefulStop (带 timeout fallback) → 关闭 Metrics → 关闭 Storage
-- **gRPC 拦截器链** (`internal/server/interceptor.go`):
-  - **RecoveryInterceptor**: panic 恢复，返回 `codes.Internal`，记录 error log，防止进程崩溃
-  - **MetricsInterceptor**: 统计 gRPC 方法调用次数和延迟（Prometheus 指标）
-  - **LoggingInterceptor**: Zap 结构化日志，记录方法名、耗时、状态码
-- **gRPC Health Check**: 注册 `grpc.health.v1` 服务，启动时 `SERVING`，关闭时 `NOT_SERVING`
-- **优雅启停**: gRPC GracefulStop 带 10s drain timeout，超时后强制 Stop
+- **统一启动流程** (`cmd/server/main.go`):
+  - 10 步启动：配置 → Tracer → 存储引擎 → CP/AP 模式选择 → gRPC Server → 拦截器链 → Metrics HTTP → Etcd 注册 → Migrator
+  - 优雅关闭：gRPC GracefulStop → HTTP Shutdown → Migrator Stop → Etcd 注销
+- **gRPC 拦截器链** (`internal/transport/grpc/kv_server.go`):
+  - **RequestIDInterceptor**: 生成/透传 request-id
+  - **RecoveryInterceptor**: panic 恢复
+  - **RateLimitInterceptor**: 令牌桶限流
+  - **CircuitBreakerInterceptor**: 熔断降级
+  - **MetricsInterceptor**: Prometheus 指标统计
+  - **LoggingInterceptor**: Zap 结构化日志（支持采样）
+- **gRPC Health Check**: 注册 `grpc.health.v1` 服务
+- **Readiness Probe**: `/ready` 检查 Etcd 连通性 + 存储初始化
 
 ### 客户端工业标准特性
 
@@ -186,10 +188,11 @@ sequenceDiagram
 
 ### 分布式 KV 存储
 
-- **可插拔存储引擎**:
-  - [x] **MemDB**: 基于 `sync.RWMutex` 的分片锁存储 (256 分片)，高并发优化
-  - [x] **SimpleMap**: 基于标准 `map[string]*item` + `sync.RWMutex` 的参考实现，轻量易扩展
-  - [x] `Engine` 统一接口：`Get` / `Set` / `Delete` / `Stats` / `Close`
+- **可插拔存储引擎**（按维度自由组合）:
+  - **Shard 类型**: `zerogc`（预分配零 GC）/ `map`（标准 map）
+  - **锁类型**: `sharded`（256 把 RWMutex）/ `global`（全局锁）
+  - **分片数**: 可配置，默认 256（2^8）
+  - `Engine` 统一接口：`Get` / `Set` / `Delete` / `Stats` / `Close`
 - **Raft 强一致性**:
   - [x] 自研简化 Raft：Leader 选举、日志复制、Apply Loop
   - [x] gRPC 传输层：节点间 `RequestVote` / `AppendEntries` 通信
@@ -238,7 +241,9 @@ sequenceDiagram
 - [x] **工业级 Client 集成**: 自动使用连接池、健康探测、重试、熔断
 
 ### 无感扩容机制
-- [] 待解决新增AP模式的存储结点导致的hash环冲突问题，实现数据的无感迁移问题
+- [x] **双环读回退**: 节点变更时维护 activeRing + prevRing，fallback 读取避免 miss
+- [x] **Push 数据迁移**: 新增 `InternalSet` RPC 实现节点间数据迁移
+- [x] **后台迁移器**: 定时扫描本地缓存，将属于新节点的 key Push 过去
 
 ---
 
@@ -328,12 +333,13 @@ go run cmd/benchmark/main.go -c 100 -n 500000 -mode ap -op mixed
 
 | 场景 | 并发 | 总请求 | 平均 QPS | 成功率 |
 |------|------|--------|----------|--------|
-| AP Mode (CDC Disabled) | 100 | 500,000 | ~42,000 | 100% |
-| AP Mode (CDC Enabled) | 100 | 500,000 | ~32,000 | 100% |
+| AP Set (ZeroGC+Sharded, 256) | 32 | — | ~3.1M ops/s | 100% |
+| AP Get (Map+Sharded, 256) | 32 | — | ~7.1M ops/s | 100% |
 | CP Mode (Raft) | 100 | 100,000 | ~8,000 | 100% |
 
+> AP 模式按 1s / 32ns ≈ 31M ops/s 理论峰值（实际受网络和序列化限制）。
 > CP 模式因 Raft 日志复制和共识开销，QPS 低于 AP 模式，但保证了线性一致性。
-> 详细的压测数据和复现步骤请参阅 [性能测试报告](PERFORMANCE.md)。
+> 详细的 ShardedEngine 微基准测试见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ---
 
@@ -346,55 +352,59 @@ go run cmd/benchmark/main.go -c 100 -n 500000 -mode ap -op mixed
 │       └── raft/
 │           └── raft.proto      # Raft 节点间通信协议
 ├── cmd/                        # 程序入口
-│   ├── benchmark/              # 压测工具（连接池/健康探测/重试/熔断）
+│   ├── benchmark/              # 压测工具
 │   ├── client/                 # 交互式 CLI 客户端
-│   ├── gateway/                # HTTP 网关
-│   ├── server/                 # KV 存储服务（使用统一 Server 包装）
+│   ├── gateway/                # HTTP/gRPC 网关
+│   ├── server/                 # KV 存储服务
 │   ├── cdc_consumer/           # CDC 消费者
 │   └── prometheus-sd/          # Prometheus 服务发现
 ├── configs/                    # 配置文件
-│   ├── config.yaml             # 服务端配置 (storage, raft 段)
+│   ├── config.yaml             # 服务端配置
 │   └── prometheus.yaml         # Prometheus 配置
 ├── internal/                   # 私有业务逻辑
-│   ├── config/                 # 配置解析（环境变量 + YAML）
+│   ├── app/                    # 应用层 (UseCase + NodeMeta + Migrator)
+│   ├── config/                 # 配置解析
 │   ├── event/                  # 事件总线 (RabbitMQ)
 │   ├── network/
-│   │   ├── gateway/            # HTTP 网关层
-│   │   │   ├── handler/        # HTTP Handler (KV / Health / Admin)
-│   │   │   └── router/         # Gin 路由注册
-│   │   └── protocol/           # 通信协议编解码
-│   ├── raft/                   # 自研简化 Raft 实现
-│   ├── server/                 # 统一 Server 包装（生命周期 + 拦截器 + 健康检查）
-│   ├── service/                # gRPC 服务实现 (KV + Status/RaftInfo)
-│   └── storage/                # 存储引擎抽象层
-│       ├── core/               # MemDB / SimpleMap 核心实现
-│       ├── aof/                # AOF 持久化
-│       ├── engine.go           # Engine 接口定义
-│       ├── factory.go          # 引擎工厂
-│       ├── cp_storage.go       # CP 模式包装 (Raft)
-│       └── ap_storage.go       # AP 模式包装 (Direct)
+│   │   └── gateway/            # 网关层
+│   │       ├── admin/          # Admin HTTP 接口
+│   │       ├── transport/      # gRPC 传输
+│   │       └── client.go       # Gateway 后端客户端
+│   ├── raft/                   # Raft 共识实现
+│   ├── storage/                # 存储引擎
+│   │   ├── core/               # ZeroGCShard / MapShard
+│   │   ├── shard/              # Shard 接口
+│   │   ├── locker/             # Locker 接口
+│   │   ├── aof/                # AOF 批量持久化
+│   │   ├── engine.go           # Engine 接口
+│   │   ├── factory.go          # 引擎工厂 (按维度组合)
+│   │   ├── sharded_engine.go   # 统一分片引擎
+│   │   ├── ap_storage.go       # AP 模式包装
+│   │   └── cp_storage.go       # CP 模式包装 (Raft)
+│   └── transport/
+│       └── grpc/               # gRPC KV Server 实现
 ├── pkg/                        # 公共库
 │   ├── consistent/             # 一致性哈希
-│   ├── logger/                 # Zap 日志 + 访问日志
-│   ├── metrics/                # Prometheus 指标 (Raft + Gateway + gRPC)
-│   ├── middleware/             # HTTP 中间件（限流 / 熔断 / 日志）
+│   ├── logger/                 # Zap 日志 (支持采样)
+│   ├── metrics/                # Prometheus 指标
+│   ├── resilience/             # 弹性组件 (限流器/熔断器)
 │   └── network/
-│       ├── client/             # 工业级 gRPC 客户端
-│       │   ├── client.go       # Client 主入口（路由 + 重试 + 熔断）
-│       │   ├── node_pool.go    # AP/CP 节点池与健康感知路由
-│       │   ├── pool.go         # 连接池（生命周期管理）
-│       │   ├── health.go       # 主动健康探测（HealthCheck RPC）
-│       │   ├── retry.go        # 指数退避重试策略
-│       │   └── breaker.go      # 端点级熔断器（Closed/Open/HalfOpen）
-│       ├── discovery/          # Etcd 服务发现（NodeInfo 模型）
+│       ├── client/             # gRPC 客户端 SDK
+│       │   ├── balancer/       # 负载均衡器
+│       │   ├── picker/         # 一致性哈希选择器
+│       │   ├── resolver/       # Etcd 服务解析器
+│       │   └── interceptors/   # 客户端拦截器
+│       ├── discovery/          # Etcd 注册/发现
 │       └── tracer/             # OpenTelemetry 链路追踪
-├── scripts/                    # 部署脚本
-├── docs/                       # 文档
-│   ├── API.md                  # HTTP API 文档
-│   ├── DOCKER.md               # Docker 部署指南
+├── scripts/                    # 运维脚本
+├── docs/                       # 技术文档
+│   ├── API.md
+│   ├── ARCHITECTURE.md
+│   ├── DOCKER.md
 │   └── superpowers/            # 技术深度文章
-├── docker-compose.yaml         # 完整集群编排 (CP 3节点 + AP 2节点 + 2网关)
-└── README.md                   # 本文件
+├── docker-compose.yaml
+├── PERFORMANCE.md              # 性能基准数据
+└── README.md
 ```
 
 ---
@@ -408,4 +418,4 @@ go run cmd/benchmark/main.go -c 100 -n 500000 -mode ap -op mixed
 
 ---
 
-**最后更新**: 2026-05-20
+**最后更新**: 2026-05-23

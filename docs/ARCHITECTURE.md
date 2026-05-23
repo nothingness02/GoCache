@@ -64,7 +64,7 @@ Flux-KV/
 │   ├── event/                 # RabbitMQ 事件总线（CDC）
 │   ├── network/
 │   │   ├── gateway/handler/   # HTTP 请求处理器
-│   │   ├── gateway/router/    # Gin 路由与中间件链
+│   │   ├── gateway/transport/ # gRPC 传输层
 │   │   └── protocol/          # TCP 文本协议服务器
 │   ├── app/                    # 应用层 UseCase + NodeMeta + Migrator
 │   ├── raft/                   # Raft 共识实现
@@ -173,7 +173,6 @@ Flux-KV/
 │  │  │    └─ ApplyLoop    │ │    │  Ports: 50055, 50056    │        │
 │  │  └───────────────────┘  │    └─────────────────────────┘        │
 │  │  Ports: 50052-50054     │                                        │
-│  │  Raft: 12001-12003      │                                        │
 │  └─────────────────────────┘                                        │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -290,31 +289,27 @@ type Engine interface {
 │   APStorage      │      CPStorage            │  ← 策略模式
 │  (直接透传)       │  (Engine + RaftNode)      │
 ├──────────────────┴───────────────────────────┤
-│   MemDBAdapter       │    SimpleMapEngine     │  ← 引擎实现
-│  (Adapter Pattern)   │    (map+RWMutex)       │
-├──────────────────────┴───────────────────────┤
-│   MemDB (core.MemDB)                        │  ← 核心内存存储
-│   ├─ 256 shards (ZeroGCShard)               │
-│   ├─ AOF Handler                            │
-│   └─ EventBus (RabbitMQ)                    │
+│           ShardedEngine                      │  ← 统一分片引擎
+│  ├─ Locker (Global / Sharded RWMutex)        │
+│  └─ shards[N] (ZeroGCShard / MapShard)       │
+├──────────────────────────────────────────────┤
+│   AOF Handler    │   EventBus (RabbitMQ)     │
 └──────────────────────────────────────────────┘
 ```
 
-#### MemDB 分片设计
+#### ShardedEngine 分片设计
 
-**文件**: `internal/storage/core/mem_db.go`
+**文件**: `internal/storage/sharded_engine.go`
 
-- 256 个分片，FNV-1a 哈希路由
-- 每个分片独立的 `sync.RWMutex`
-- 细粒度锁，大并发下锁竞争极低
+- `N` 个分片（默认 256），inline FNV-1a 哈希路由
+- 每个分片独立的 Locker（`sync.RWMutex`）
+- Locker 类型可配置：`sharded`（每分片一把锁）或 `global`（全局一把锁）
 - 支持 TTL 过期（惰性删除）
 
 ```go
-const ShardCount = 256
-
-func (db *MemDB) getShard(key string) *shard {
-    hash := fnv32(key)
-    return db.shards[hash%ShardCount]
+func (e *ShardedEngine) getShard(key string) int {
+    h := hash(key) // inline FNV-1a，栈上零分配
+    return int(h % uint64(e.shardCount))
 }
 ```
 
@@ -348,8 +343,9 @@ AOF 文件格式（JSON 行）:
 **文件**: `internal/storage/factory.go`
 
 ```go
-func NewEngine(engineType string, cfg *config.Config) (Engine, error)
-// 支持: "memdb" (默认), "simplemap"
+func NewEngine(cfg *config.Config) (Engine, error)
+// 按维度组合: ShardType × LockerType × ShardCount
+// 例如: zerogc + sharded + 256, map + global + 0
 ```
 
 ---
@@ -500,18 +496,20 @@ cli.SetWithMode(ctx, key, value, client.ModeCP)  // CP 模式
 
 #### 路由结构
 
-**文件**: `internal/network/gateway/router/router.go`
+Gateway 使用标准 `http.ServeMux` 注册路由：
 
 ```
-GET  /health                  → healthHandler.Ping
+GET  /health                  → health handler
+GET  /ready                   → readiness handler
+GET  /metrics                 → Prometheus handler
 
-POST   /api/v1/kv            → kvHandler.HandleSet    (with CircuitBreaker)
-GET    /api/v1/kv            → kvHandler.HandleGet    (with CircuitBreaker)
-DELETE /api/v1/kv            → kvHandler.HandleDel    (with CircuitBreaker)
+POST   /api/v1/kv            → KV Set
+GET    /api/v1/kv            → KV Get
+DELETE /api/v1/kv            → KV Del
 
-GET /admin/nodes             → adminHandler.ListNodes
-GET /admin/nodes/:addr/status → adminHandler.NodeStatus
-GET /admin/stats             → adminHandler.ClusterStats
+GET /admin/nodes             → admin.ListNodes
+GET /admin/nodes/:addr/status → admin.NodeStatus
+GET /admin/stats             → admin.ClusterStats
 ```
 
 #### 中间件链（按执行顺序）
@@ -523,8 +521,6 @@ GET /admin/stats             → adminHandler.ClusterStats
 5. `middleware.CircuitBreaker("kv-service")` — API 路由熔断保护
 
 #### SingleFlight 请求去重
-
-**文件**: `internal/network/gateway/handler/kv.go:76`
 
 GET 请求使用 `singleflight.Group` 合并同一 key 的并发请求：
 - 第一个请求执行实际查询
@@ -588,15 +584,6 @@ service RaftService {
 }
 ```
 
-#### TCP 文本协议
-
-**文件**: `internal/network/protocol/`
-
-简单的文本协议，用于非 gRPC 客户端：
-- 编码：`[4字节长度][Payload]`
-- 支持命令：`SET key value`, `GET key`, `DEL key`
-- 返回：`OK` 或值或 `(nil)`
-
 ---
 
 ### 4.7 可观测性
@@ -643,15 +630,16 @@ Prometheus 指标定义：
 ```go
 type Config struct {
     Server   ServerConfig   // port, mode
-    Storage  StorageConfig  // engine type
-    Raft     RaftConfig     // enabled, node_id, peers, bind_addr
-    AOF      AOFConfig      // filename, append_fsync
+    Storage  StorageConfig  // shard_type, locker_type, shard_count, shard_size
+    Raft     RaftConfig     // enabled, node_id, peers, data_dir
+    AOF      AOFConfig      // filename, append_fsync, batch_size, flush_interval_ms
     Etcd     EtcdConfig     // endpoints
     RabbitMQ RabbitMQConfig // url
     Jaeger   JaegerConfig   // endpoint
     Pprof    PprofConfig    // enabled, port
     CDC      CDCConfig      // exchange, queue, log_path
-    Log      LogConfig      // level, encoding
+    Log      LogConfig      // level, encoding, sampling
+    Gateway  GatewayConfig  // grpc_port, metrics_port, rate_limiter, circuit_breaker
 }
 ```
 
@@ -666,40 +654,31 @@ type Config struct {
 
 ---
 
-### 4.9 Server 生命周期 (internal/server/server.go)
+### 4.9 Server 启动流程 (cmd/server/main.go)
 
-#### NewServer 初始化流程
-
-```
-1. 初始化存储引擎（NewEngine）
-2. 根据 raft.enabled 选择 CP 或 AP 模式
-   ├─ CP: NewCPStorage(rawEngine, raftCfg) → RaftNode.Start() → StartServer(raftBindAddr)
-   └─ AP: NewAPStorage(rawEngine)
-3. 创建 gRPC Server（带 keepalive + interceptor chain）
-4. 注册 KVService + HealthService + Reflection
-5. 创建 Metrics HTTP Server (:9090)
-6. 创建 gRPC Listener
-```
-
-#### Start 启动顺序
+#### 启动顺序
 
 ```
-1. 启动 gRPC Server（goroutine）
-2. 启动 Metrics HTTP Server（goroutine）
-3. 注册到 Etcd
-4. 设置 Health Check = SERVING
-5. CP 模式：启动 Raft 指标上报 goroutine
+1. 初始化配置（Viper：环境变量 > config.yaml > 默认值）
+2. 初始化 Jaeger Tracer（如配置）
+3. 创建存储引擎（NewEngine — 按维度组合）
+4. 根据 raft.enabled 选择模式：
+   ├─ CP: NewCPStorage(engine, raftCfg) → 启动 Raft Node
+   └─ AP: NewAPStorage(engine)
+5. 创建 gRPC Server（KV + Raft 共享端口）
+6. 注册拦截器链：Recovery → RateLimit → CircuitBreaker → Metrics → Logging
+7. 启动 Metrics HTTP Server (:9090)
+8. 注册到 Etcd（含 readiness 健康检查）
+9. AP 模式：启动后台数据 Migrator
 ```
 
-#### Stop 优雅关闭
+#### 优雅关闭
 
 ```
-1. Health Check = NOT_SERVING（停止接收新流量）
-2. 停止 Raft 指标 goroutine
-3. 撤销 Etcd 注册
-4. gRPC GracefulStop（带 timeout fallback）
-5. 关闭 Metrics HTTP Server
-6. 关闭存储引擎（触发 AOF Close、EventBus Close）
+1. gRPC GracefulStop
+2. Admin HTTP Server Shutdown
+3. 停止 Migrator
+4. 注销 Etcd
 ```
 
 ---
@@ -814,8 +793,7 @@ Write to /app/logs/flux_cdc.log
 │  ▼             ▼  ▼             ▼             ▼            │
 │  CP-1        CP-2 CP-3        AP-1           AP-2          │
 │  :50052      :50053 :50054    :50055         :50056       │
-│  :12001      :12002 :12003    :9094          :9095        │
-│  :9091       :9092  :9093                                   │
+│  :9090       :9090  :9090     :9090          :9090        │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  Gateway-1 (:8080)  <──>  Gateway-2 (:8081)          │  │
@@ -833,10 +811,8 @@ Write to /app/logs/flux_cdc.log
 | 服务 | 端口 | 说明 |
 |------|------|------|
 | CP Node 1-3 | 50052-50054 | gRPC 服务 |
-| CP Node 1-3 | 12001-12003 | Raft RPC |
-| CP Node 1-3 | 9091-9093 | Metrics HTTP |
 | AP Node 1-2 | 50055-50056 | gRPC 服务 |
-| AP Node 1-2 | 9094-9095 | Metrics HTTP |
+| All Nodes | 9090 | Metrics HTTP / Health |
 | Gateway 1-2 | 8080-8081 | HTTP API |
 | Etcd | 2379 | Client API |
 | RabbitMQ | 5672 | AMQP / 15672 Management |
@@ -887,36 +863,36 @@ func (c *RaftCluster) WaitForApplied(minApplied, timeout)
 | **引擎工厂** | `internal/storage/factory.go` |
 | **AP 模式** | `internal/storage/ap_storage.go` |
 | **CP 模式** | `internal/storage/cp_storage.go` |
-| **MemDB 适配器** | `internal/storage/memdb_adapter.go` |
-| **MemDB 核心** | `internal/storage/core/mem_db.go` |
-| **ZeroGCShard** | `internal/storage/core/cache.go` |
+| **ShardedEngine** | `internal/storage/sharded_engine.go` |
+| **Shard 接口** | `internal/storage/shard/shard.go` |
+| **ZeroGCShard / MapShard** | `internal/storage/core/cache.go` |
+| **Locker 接口** | `internal/storage/locker/locker.go` |
 | **AOF 持久化** | `internal/storage/aof/aof.go` |
-| **SimpleMap** | `internal/storage/simplemap.go` |
 | **Raft 状态机** | `internal/raft/node.go` |
 | **Raft 配置** | `internal/raft/config.go` |
 | **Raft 类型** | `internal/raft/types.go` |
 | **Raft 应用** | `internal/raft/apply.go` |
 | **Raft 传输** | `internal/raft/transport.go` |
-| **gRPC 服务实现** | `internal/service/handler.go` |
-| **Server 生命周期** | `internal/server/server.go` |
-| **网关路由** | `internal/network/gateway/router/router.go` |
-| **网关 KV 处理** | `internal/network/gateway/handler/kv.go` |
-| **网关 Admin** | `internal/network/gateway/handler/admin.go` |
-| **TCP 协议** | `internal/network/protocol/` |
+| **gRPC KV Server** | `internal/transport/grpc/kv_server.go` |
+| **UseCase 业务逻辑** | `internal/app/kv.go` |
+| **AP 数据迁移器** | `internal/app/migrator.go` |
+| **Gateway 后端客户端** | `internal/network/gateway/client.go` |
+| **Admin HTTP 接口** | `internal/network/gateway/admin/http.go` |
 | **客户端 SDK** | `pkg/network/client/client.go` |
 | **连接池** | `pkg/network/client/pool.go` |
 | **健康检查** | `pkg/network/client/health.go` |
 | **熔断器** | `pkg/network/client/breaker.go` |
 | **重试** | `pkg/network/client/retry.go` |
-| **节点选择** | `pkg/network/client/node_pool.go` |
+| **负载均衡器** | `pkg/network/client/balancer/flux.go` |
+| **一致性哈希选择器** | `pkg/network/client/picker/hash.go` |
 | **服务注册** | `pkg/network/discovery/register.go` |
 | **服务发现** | `pkg/network/discovery/discovery.go` |
 | **配置管理** | `internal/config/config.go` |
 | **日志** | `pkg/logger/logger.go` |
 | **指标** | `pkg/metrics/metrics.go` |
 | **一致性哈希** | `pkg/consistent/consistent.go` |
-| **限流中间件** | `pkg/middleware/ratelimit.go` |
-| **熔断中间件** | `pkg/middleware/circuit_breaker.go` |
+| **熔断器组件** | `pkg/resilience/circuitbreaker/circuitbreaker.go` |
+| **限流器组件** | `pkg/resilience/ratelimiter/ratelimiter.go` |
 | **gRPC Proto** | `api/proto/kv.proto`, `api/proto/raft/raft.proto` |
 | **Server 入口** | `cmd/server/main.go` |
 | **Gateway 入口** | `cmd/gateway/main.go` |
@@ -929,8 +905,7 @@ func (c *RaftCluster) WaitForApplied(minApplied, timeout)
 | 模式 | 应用位置 | 说明 |
 |------|----------|------|
 | **策略模式** | `APStorage` / `CPStorage` | 运行时切换一致性策略 |
-| **适配器模式** | `MemDBAdapter` | 将 `core.MemDB` 适配为 `Engine` 接口 |
-| **工厂模式** | `NewEngine()` | 根据字符串创建对应引擎 |
+| **工厂模式** | `NewEngine()` | 按 ShardType × LockerType × ShardCount 维度组合创建引擎 |
 | **单例模式** | `pkg/logger.Log` | 全局日志实例 |
 | **观察者模式** | `EventBus` | RabbitMQ 事件发布/订阅 |
 | **连接池** | `ConnPool` | gRPC 连接复用与生命周期 |
