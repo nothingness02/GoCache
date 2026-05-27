@@ -27,8 +27,8 @@ func (n *RaftNode) takeSnapshot() error {
 	}
 	lastIncludedIndex := n.lastApplied
 	lastIncludedTerm := uint64(0)
-	if lastIncludedIndex > 0 && lastIncludedIndex <= uint64(len(n.log)) {
-		lastIncludedTerm = n.log[lastIncludedIndex-1].Term
+	if lastIncludedIndex > n.logOffset && lastIncludedIndex <= n.lastLogIndex() {
+		lastIncludedTerm = n.log[lastIncludedIndex-n.logOffset-1].Term
 	}
 	n.mu.Unlock()
 
@@ -49,6 +49,13 @@ func (n *RaftNode) takeSnapshot() error {
 
 	n.mu.Lock()
 	n.lastSnapshotIndex = lastIncludedIndex
+	n.lastSnapshotTerm = lastIncludedTerm
+	if lastIncludedIndex >= n.lastLogIndex() {
+		n.log = n.log[:0]
+	} else {
+		n.log = n.log[lastIncludedIndex-n.logOffset:]
+	}
+	n.logOffset = lastIncludedIndex
 	n.saveState()
 	n.mu.Unlock()
 

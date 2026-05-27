@@ -66,6 +66,13 @@ func (m *RingMetrics) ShouldKeepPrevRing() bool {
 	return true
 }
 
+// OldRingHits 返回当前旧环回退命中计数（用于测试）
+func (m *RingMetrics) OldRingHits() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.oldRingHits
+}
+
 // Reset 重置计数器（节点变更时调用）
 func (m *RingMetrics) Reset() {
 	m.mu.Lock()

@@ -45,6 +45,8 @@ func NewNode(cfg *Config, storage ApplyStorage) (*RaftNode, error) {
 				return nil, fmt.Errorf("failed to restore snapshot: %w", err)
 			}
 			n.lastSnapshotIndex = meta.LastIncludedIndex
+			n.lastSnapshotTerm = meta.LastIncludedTerm
+			n.logOffset = meta.LastIncludedIndex
 			n.lastApplied = meta.LastIncludedIndex
 			log.Printf("[Raft] %s restored snapshot at index %d", cfg.NodeID, meta.LastIncludedIndex)
 		}
@@ -60,8 +62,19 @@ func NewNode(cfg *Config, storage ApplyStorage) (*RaftNode, error) {
 		}
 		n.currentTerm = term
 		n.votedFor = votedFor
-		n.log = entries
-		log.Printf("[Raft] %s loaded WAL state: term=%d, logEntries=%d", cfg.NodeID, term, len(entries))
+		// 过滤掉快照之前的日志（处理崩溃在快照后 WAL 截断前的情况）
+		if n.logOffset > 0 {
+			var filtered []LogEntry
+			for _, e := range entries {
+				if e.Index > n.logOffset {
+					filtered = append(filtered, e)
+				}
+			}
+			n.log = filtered
+		} else {
+			n.log = entries
+		}
+		log.Printf("[Raft] %s loaded WAL state: term=%d, logEntries=%d", cfg.NodeID, term, len(n.log))
 	}
 
 	return n, nil
@@ -190,10 +203,7 @@ func (n *RaftNode) Propose(cmd Command) (bool, error) {
 // ===== 内部核心方法 =====
 
 func (n *RaftNode) lastLogIndex() uint64 {
-	if len(n.log) == 0 {
-		return 0
-	}
-	return n.log[len(n.log)-1].Index
+	return n.logOffset + uint64(len(n.log))
 }
 
 func (n *RaftNode) lastLogTerm() uint64 {
@@ -420,13 +430,15 @@ func (n *RaftNode) sendHeartbeats() {
 			prevLogTerm := uint64(0)
 			if nextIdx > 1 {
 				prevLogIndex = nextIdx - 1
-				if prevLogIndex <= uint64(len(n.log)) {
-					prevLogTerm = n.log[prevLogIndex-1].Term
+				if prevLogIndex == n.logOffset && n.logOffset > 0 {
+					prevLogTerm = n.lastSnapshotTerm
+				} else if prevLogIndex > n.logOffset && prevLogIndex <= n.lastLogIndex() {
+					prevLogTerm = n.log[prevLogIndex-n.logOffset-1].Term
 				}
 			}
 			var entries []LogEntry
-			if nextIdx <= uint64(len(n.log)) {
-				entries = n.log[nextIdx-1:]
+			if nextIdx > n.logOffset && nextIdx <= n.lastLogIndex() {
+				entries = n.log[nextIdx-n.logOffset-1:]
 			}
 			n.mu.RUnlock()
 
@@ -481,7 +493,7 @@ func (n *RaftNode) replicateLog() {
 
 func (n *RaftNode) tryCommit() {
 	for idx := n.commitIndex + 1; idx <= n.lastLogIndex(); idx++ {
-		if n.log[idx-1].Term != n.currentTerm {
+		if n.log[idx-n.logOffset-1].Term != n.currentTerm {
 			continue
 		}
 		count := 1 // 自己
@@ -577,28 +589,48 @@ func (n *RaftNode) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 
 	// 检查 prevLogIndex 和 prevLogTerm 是否匹配
 	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex > uint64(len(n.log)) {
+		if args.PrevLogIndex < n.logOffset {
 			return
 		}
-		if n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		if args.PrevLogIndex == n.logOffset {
+			if n.lastSnapshotTerm != args.PrevLogTerm {
+				return
+			}
+		} else if args.PrevLogIndex <= n.lastLogIndex() {
+			if n.log[args.PrevLogIndex-n.logOffset-1].Term != args.PrevLogTerm {
+				return
+			}
+		} else {
 			return
 		}
 	}
 
 	// 追加新日志条目
 	if len(args.Entries) > 0 {
-		// 截断不匹配的日志
-		if args.PrevLogIndex < uint64(len(n.log)) {
-			n.log = n.log[:args.PrevLogIndex]
+		firstIdx := args.Entries[0].Index
+		if firstIdx > n.logOffset {
+			if firstIdx <= n.lastLogIndex() {
+				n.log = n.log[:firstIdx-n.logOffset-1]
+			}
+			for _, e := range args.Entries {
+				if e.Index <= n.logOffset {
+					continue
+				}
+				expectedIdx := n.lastLogIndex() + 1
+				if e.Index == expectedIdx {
+					n.log = append(n.log, e)
+				} else {
+					break
+				}
+			}
+			n.saveState()
 		}
-		n.log = append(n.log, args.Entries...)
-		n.saveState()
 	}
 
 	// 更新 commitIndex
 	if args.LeaderCommit > n.commitIndex {
-		if args.LeaderCommit > uint64(len(n.log)) {
-			n.commitIndex = uint64(len(n.log))
+		if args.LeaderCommit > n.lastLogIndex() {
+			n.commitIndex = n.lastLogIndex()
 		} else {
 			n.commitIndex = args.LeaderCommit
 		}

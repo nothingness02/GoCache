@@ -100,6 +100,10 @@ type RaftNode struct {
 
 	// 快照状态
 	lastSnapshotIndex uint64
+	lastSnapshotTerm  uint64
+
+	// 日志偏移（已被快照截断的日志数量，log[0] 的实际 Index = logOffset + 1）
+	logOffset uint64
 
 	// 控制通道
 	stopCh     chan struct{}

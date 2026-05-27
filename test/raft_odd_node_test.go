@@ -39,15 +39,23 @@ func TestRaft_OddNode_NormalOperation(t *testing.T) {
 	if !cluster.WaitForApplied(21, 5*time.Second) {
 		t.Fatal("timeout waiting for all nodes to apply 20 commands")
 	}
-
+	pre_value := ""
 	// 验证数据一致性
 	for _, id := range []string{"n1", "n2", "n3"} {
 		wrap := cluster.GetNode(id)
 		if wrap == nil {
 			continue
 		}
-		if wrap.Storage.Get("key_a") == "" {
+		value := wrap.Storage.Get("key_a")
+		if value == "" {
 			t.Fatalf("node %s should have key_a", id)
+		}
+		if pre_value == "" {
+			pre_value = value
+		} else {
+			if pre_value != value {
+				t.Fatalf("node %s should data not consistence ", id)
+			}
 		}
 	}
 

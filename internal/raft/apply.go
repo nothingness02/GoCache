@@ -19,12 +19,12 @@ func (n *RaftNode) applyLoop() {
 			n.mu.Lock()
 			for n.lastApplied < n.commitIndex {
 				n.lastApplied++
-				if n.lastApplied > uint64(len(n.log)) {
-					log.Printf("[Raft] applyLoop: lastApplied %d > log length %d", n.lastApplied, len(n.log))
-					n.lastApplied = uint64(len(n.log))
+				if n.lastApplied > n.lastLogIndex() {
+					log.Printf("[Raft] applyLoop: lastApplied %d > lastLogIndex %d", n.lastApplied, n.lastLogIndex())
+					n.lastApplied = n.lastLogIndex()
 					break
 				}
-				entry := n.log[n.lastApplied-1]
+				entry := n.log[n.lastApplied-n.logOffset-1]
 				// no-op entry (empty command) — skip
 				if len(entry.Command) == 0 {
 					continue

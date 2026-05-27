@@ -24,7 +24,7 @@ func init() {
 
 // Register 注册 Balancer（供外部调用）
 func Register() {
-	// init() 已自动注册，此处留作显式调用入口
+	//init() //已自动注册，此处留作显式调用入口
 }
 
 type fluxPickerBuilder struct {
@@ -33,6 +33,9 @@ type fluxPickerBuilder struct {
 	prevAddrs       []string
 	prevRingAt      time.Time
 	metrics         *picker.RingMetrics
+	lastCpPicker    *picker.LeaderPicker
+	lastCpAddrs     []string
+	lastCpLeader    balancer.SubConn
 }
 
 func stringSlicesEqual(a, b []string) bool {
@@ -52,6 +55,7 @@ func (b *fluxPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 	cpInfos := make([]picker.SubConnInfo, 0)
 	var leader balancer.SubConn
 	var currentAddrs []string
+	var cpAddrs []string
 
 	for sc, scInfo := range info.ReadySCs {
 		addr := scInfo.Address.Addr
@@ -64,6 +68,7 @@ func (b *fluxPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 
 		if mode == "cp" {
 			cpInfos = append(cpInfos, picker.SubConnInfo{SubConn: sc, Addr: addr})
+			cpAddrs = append(cpAddrs, addr)
 			if scInfo.Address.Attributes != nil {
 				if isLeader, ok := scInfo.Address.Attributes.Value("is_leader").(bool); ok && isLeader {
 					leader = sc
@@ -76,6 +81,7 @@ func (b *fluxPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 	}
 
 	sort.Strings(currentAddrs)
+	sort.Strings(cpAddrs)
 
 	b.mu.Lock()
 	if b.metrics == nil {
@@ -99,11 +105,26 @@ func (b *fluxPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 			b.prevRingAt = time.Time{}
 		}
 	}
+
+	// CP 模式：如果节点地址没变且 leader 变了，复用 LeaderPicker 只更新 leader
+	var cpPicker balancer.Picker
+	if stringSlicesEqual(b.lastCpAddrs, cpAddrs) && b.lastCpPicker != nil {
+		if leader != b.lastCpLeader {
+			b.lastCpPicker.UpdateLeader(leader)
+			b.lastCpLeader = leader
+		}
+		cpPicker = b.lastCpPicker
+	} else {
+		b.lastCpPicker = picker.NewLeaderPicker(cpInfos, leader)
+		b.lastCpAddrs = cpAddrs
+		b.lastCpLeader = leader
+		cpPicker = b.lastCpPicker
+	}
 	b.mu.Unlock()
 
 	return &fluxPicker{
 		apPicker: picker.NewHashPicker(apInfos, prevAddrs, b.metrics),
-		cpPicker: picker.NewLeaderPicker(cpInfos, leader),
+		cpPicker: cpPicker,
 	}
 }
 

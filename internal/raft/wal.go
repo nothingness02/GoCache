@@ -100,5 +100,5 @@ func atomicWriteFile(path string, data []byte) error {
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return os.Rename(tmp, path) // rename是原子操作，要么成功要么失败
 }
